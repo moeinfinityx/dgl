@@ -425,3 +425,269 @@ class GNNExplainer(nn.Module):
         edge_mask = edge_mask.detach().sigmoid()
 
         return feat_mask, edge_mask
+
+
+class HeteroGNNExplainer(nn.Module):
+    coeffs = {
+        'edge_size': 0.005,
+        'edge_ent': 1.0,
+        'node_feat_size': 1.0,
+        'node_feat_ent': 0.1
+    }
+
+    def __init__(self, model, num_hops, lr=0.01, num_epochs=100):
+        super(HeteroGNNExplainer, self).__init__()
+        self.model = model
+        self.num_hops = num_hops
+        self.lr = lr
+        self.num_epochs = num_epochs
+
+    def _init_masks(self, graph, feat):
+        r"""Initialize learnable feature and edge mask.
+
+        Parameters
+        ----------
+        graph : DGLHeteroGraph
+            Input graph.
+        feat : Dictionary of Tensor
+            Input node features.
+
+        Returns
+        -------
+        feat_mask : Dictionary of Tensor
+            Dictionary of { ntypes: features }
+            Feature mask of shape :math:`(1, D)`, where :math:`D`
+            is the feature size.
+        edge_mask : Dictionary of Tensor
+            Dictionary of { canonical_etypes: features }
+            Edge mask of shape :math:`(E)`, where :math:`E` is the
+            number of edges.
+        """
+        device = graph.device
+        feat_mask = {}
+        for node_type, feature in feat.items():
+            if len(feature.size()) == 1:
+                feat_mask[node_type] = nn.Parameter(torch.zeros(1, 1, device=device))
+            else:
+                num_nodes, feat_size = feature.size()
+                std = 0.1
+                feat_mask[node_type] = nn.Parameter(torch.randn(1, feat_size, device=device) * std)
+
+        edge_mask = {}
+        for canonical_etype in graph.canonical_etypes:
+            src = canonical_etype[0]
+            num_nodes = graph.number_of_nodes(src)
+            num_edges = graph.number_of_edges(canonical_etype)
+
+            std = nn.init.calculate_gain('relu') * torch.sqrt(2.0 / (2 * num_nodes))
+            edge_mask[canonical_etype] = nn.Parameter(torch.randn(num_edges, device=device) * std)
+
+        return feat_mask, edge_mask
+
+    def _loss_regularize(self, loss, feat_masks, edge_masks):
+        r"""Add regularization terms to the loss.
+
+        Parameters
+        ----------
+        loss : Tensor
+            Loss value.
+        feat_mask : Dictionary of Tensor
+            Dictionary of { ntypes: features }
+            Feature mask of shape :math:`(1, D)`, where :math:`D`
+            is the feature size.
+        edge_mask : Dictionary of Tensor
+            Dictionary of { canonical_etypes: features }
+            Edge mask of shape :math:`(E)`, where :math:`E`
+            is the number of edges.
+
+        Returns
+        -------
+        Tensor
+            Loss value with regularization terms added.
+        """
+        # epsilon for numerical stability
+        eps = 1e-15
+
+        for edge_mask in edge_masks.values():
+            edge_mask = edge_mask.sigmoid()
+            # Edge mask sparsity regularization
+            loss = loss + self.coeffs['edge_size'] * torch.sum(edge_mask)
+            # Edge mask entropy regularization
+            ent = - edge_mask * torch.log(edge_mask + eps) - \
+                (1 - edge_mask) * torch.log(1 - edge_mask + eps)
+            loss = loss + self.coeffs['edge_ent'] * ent.mean()
+
+        for feat_mask in feat_masks.values():
+            feat_mask = feat_mask.sigmoid()
+            # Feature mask sparsity regularization
+            loss = loss + self.coeffs['node_feat_size'] * torch.mean(feat_mask)
+            # Feature mask entropy regularization
+            ent = -feat_mask * torch.log(feat_mask + eps) - \
+                (1 - feat_mask) * torch.log(1 - feat_mask + eps)
+            loss = loss + self.coeffs['node_feat_ent'] * ent.mean()
+
+        return loss
+
+    def explain_node(self, ntype, node_id, graph, feat, **kwargs):
+        r"""Learn and return a node feature mask and subgraph that play a
+        crucial role to explain the prediction made by the GNN for node
+        :attr:`node_id`.
+
+        Parameters
+        ----------
+        ntype: str
+            The node type of the node to explain.
+        node_id : int
+            The node to explain.
+        graph : DGLHeteroGraph
+            A heterogeneous graph.
+        feat : Dictionary of Tensor
+            Dictionary of { ntypes: features }
+            The input feature of shape :math:`(N, D)`. :math:`N` is the
+            number of nodes, and :math:`D` is the feature size.
+        kwargs : dict
+            Additional arguments passed to the GNN model. Tensors whose
+            first dimension is the number of nodes or edges will be
+            assumed to be node/edge features.
+
+        Returns
+        -------
+        new_node_id : Tensor
+            The new ID of the input center node.
+        sg : DGLHeteroGraph
+            The subgraph induced on the k-hop in-neighborhood of :attr:`node_id`.
+        feat_mask : Dictionary of Tensor
+            Dictionary of { ntypes: features }
+            Learned feature importance mask of shape :math:`(D)`, where :math:`D` is the
+            feature size. The values are within range :math:`(0, 1)`.
+            The higher, the more important.
+        edge_mask : Dictionary of Tensor
+            Dictionary of { canonical_etypes: features }
+            Learned importance mask of the edges in the subgraph, which is a tensor
+            of shape :math:`(E)`, where :math:`E` is the number of edges in the
+            subgraph. The values are within range :math:`(0, 1)`.
+            The higher, the more important.
+        """
+        self.model.eval()
+        num_nodes = graph.num_nodes()
+        num_edges = graph.num_edges()
+
+        # Extract node-centered k-hop subgraph and
+        # its associated node and edge features.
+        sg, inverse_indices = khop_in_subgraph(graph, {ntype: node_id},self.num_hops)
+        inverse_indices = inverse_indices[ntype]
+
+        sg_nodes = sg.ndata[NID].long()
+        sg_edges = sg.edata[EID].long()
+        
+        for node_type in feat.keys():
+            feat[node_type] = feat[node_type][sg_nodes]
+
+        for key, item in kwargs.items():
+            if torch.is_tensor(item) and item.size(0) == num_nodes:
+                item = item[sg_nodes]
+            elif torch.is_tensor(item) and item.size(0) == num_edges:
+                item = item[sg_edges]
+            kwargs[key] = item
+
+        # Get the initial prediction.
+        with torch.no_grad():
+            logits = self.model(sg, feat, **kwargs)[ntype]
+            pred_label = logits.argmax(dim=-1)
+
+        feat_mask, edge_mask = self._init_masks(sg, feat)
+
+        params = []
+        params.extend(feat_mask.values())
+        params.extend(edge_mask.values())
+        optimizer = torch.optim.Adam(params, lr=self.lr)
+
+        for _ in range(self.num_epochs):
+            optimizer.zero_grad()
+            h = {}
+            for node_type in feat.keys():
+                h[node_type] = feat[node_type] * feat_mask[node_type].sigmoid()
+            eweight = {}
+            for canonical_etype in edge_mask.keys():
+                eweight[canonical_etype] = edge_mask[canonical_etype].sigmoid()
+            logits = self.model(sg, h, eweight=eweight, **kwargs)[ntype]
+            log_probs = logits.log_softmax(dim=-1)
+            loss = -log_probs[inverse_indices, pred_label[inverse_indices]]
+            loss = self._loss_regularize(loss, feat_mask, edge_mask)
+            loss.backward()
+            optimizer.step()
+
+        for node_type in feat_mask.keys():
+            feat_mask[node_type] = feat_mask[node_type].detach().sigmoid().squeeze()
+        for canonical_etype in edge_mask.keys():
+            edge_mask[canonical_etype] = edge_mask[canonical_etype].detach().sigmoid()
+
+        return inverse_indices, sg, feat_mask, edge_mask
+
+    def explain_graph(self, graph, feat, **kwargs):
+        r"""Learn and return a node feature mask and an edge mask that play a
+        crucial role to explain the prediction made by the GNN for a graph.
+
+        Parameters
+        ----------
+        graph : DGLHeteroGraph
+            A heterogeneous graph.
+        feat : Dictionary of Tensor
+            Dictionary of { ntypes: features }
+            The input feature of shape :math:`(N, D)`. :math:`N` is the
+            number of nodes, and :math:`D` is the feature size.
+        kwargs : dict
+            Additional arguments passed to the GNN model. Tensors whose
+            first dimension is the number of nodes or edges will be
+            assumed to be node/edge features.
+
+        Returns
+        -------
+        feat_mask : Dictionary of Tensor
+            Dictionary of { ntypes: features }
+            Learned feature importance mask of shape :math:`(D)`, where :math:`D` is the
+            feature size. The values are within range :math:`(0, 1)`.
+            The higher, the more important.
+        edge_mask : Dictionary of Tensor
+            Dictionary of { canonical_etypes: features }
+            Learned importance mask of the edges in the graph, which is a tensor
+            of shape :math:`(E)`, where :math:`E` is the number of edges in the
+            graph. The values are within range :math:`(0, 1)`. The higher,
+            the more important.
+        """
+        self.model.eval()
+
+        # Get the initial prediction.
+        with torch.no_grad():
+            logits = self.model(graph, feat, **kwargs)
+            pred_label = logits.argmax(dim=-1)
+
+        feat_mask, edge_mask = self._init_masks(graph, feat)
+
+        params = []
+        params.extend(feat_mask.values())
+        params.extend(edge_mask.values())
+        optimizer = torch.optim.Adam(params, lr=self.lr)
+
+        for _ in range(self.num_epochs):
+            optimizer.zero_grad()
+            h = {}
+            for node_type in feat.keys():
+                h[node_type] = feat[node_type] * feat_mask[node_type].sigmoid()
+            eweight = {}
+            for canonical_etype in edge_mask.keys():
+                eweight[canonical_etype] = edge_mask[canonical_etype].sigmoid()
+            logits = self.model(graph, h, eweight=eweight, **kwargs)
+            log_probs = logits.log_softmax(dim=-1)
+            loss = -log_probs[0, pred_label[0]]
+            loss = self._loss_regularize(loss, feat_mask, edge_mask)
+            loss.backward()
+            optimizer.step()
+
+        for node_type in feat_mask.keys():
+            feat_mask[node_type] = feat_mask[node_type].detach().sigmoid().squeeze()
+
+        for canonical_etype in edge_mask.keys():
+            edge_mask[canonical_etype] = edge_mask[canonical_etype].detach().sigmoid()
+
+        return feat_mask, edge_mask
