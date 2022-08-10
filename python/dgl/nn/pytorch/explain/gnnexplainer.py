@@ -186,7 +186,7 @@ class GNNExplainer(nn.Module):
         >>> # Load dataset
         >>> data = CoraGraphDataset()
         >>> g = data[0]
-        >>> features = g.ndata['feat']s
+        >>> features = g.ndata['feat']
         >>> labels = g.ndata['label']
         >>> train_mask = g.ndata['train_mask']
         >>> # Define a model
