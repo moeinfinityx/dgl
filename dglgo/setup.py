@@ -4,7 +4,7 @@ from setuptools import find_packages
 from distutils.core import setup
 
 setup(name='dglgo',
-      version='0.0.1',
+      version='0.0.2',
       description='DGL',
       author='DGL Team',
       author_email='wmjlyjemaine@gmail.com',
@@ -16,7 +16,10 @@ setup(name='dglgo',
           'numpydoc>=1.1.0',
           "pydantic>=1.9.0",
           "ruamel.yaml>=0.17.20",
-          "PyYAML>=5.1"
+          "PyYAML>=5.1",
+          "ogb>=1.3.3",
+          "rdkit-pypi",
+          "scikit-learn>=0.20.0"
       ],
       package_data={"": ["./*"]},
       include_package_data=True,

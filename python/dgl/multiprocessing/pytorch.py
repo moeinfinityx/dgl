@@ -44,10 +44,8 @@ def _get_shared_mem_name(id_):
     return "shared" + str(id_)
 
 def call_once_and_share(func, shape, dtype, rank=0):
-    """Invoke the function in a single process of the process group spawned by
-    :func:`spawn`, and share the result to other processes.
-
-    Requires the subprocesses to be spawned with :func:`dgl.multiprocessing.pytorch.spawn`.
+    """Invoke the function in a single process of the PyTorch distributed process group,
+    and share the result with other processes.
 
     Parameters
     ----------
@@ -71,7 +69,10 @@ def call_once_and_share(func, shape, dtype, rank=0):
 
     # Process with the given rank creates and populates the shared memory array.
     if current_rank == rank:
-        id_ = random.getrandbits(32)
+        # PyTorch Lightning 1.6+ seems to set the random seed during process spawning
+        # to the same seed value.
+        random_ = random.Random()
+        id_ = random_.getrandbits(32)
         name = _get_shared_mem_name(id_)
         result = create_shared_mem_array(name, shape, dtype)
         result[:] = func()
@@ -89,7 +90,7 @@ def call_once_and_share(func, shape, dtype, rank=0):
 
 def shared_tensor(shape, dtype=torch.float32):
     """Create a tensor in shared memory accessible by all processes within the same
-    ``torch.distsributed`` process group.
+    ``torch.distributed`` process group.
 
     The content is uninitialized.
 

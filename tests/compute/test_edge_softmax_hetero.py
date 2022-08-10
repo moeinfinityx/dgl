@@ -2,6 +2,7 @@ import dgl
 from dgl.ops import edge_softmax
 import dgl.function as fn
 from collections import Counter
+import math
 import numpy as np
 import scipy.sparse as ssp
 import itertools
@@ -10,14 +11,12 @@ import networkx as nx
 import unittest, pytest
 from dgl import DGLError
 import test_utils
-from test_utils import parametrize_dtype, get_cases
+from test_utils import parametrize_idtype, get_cases
 from scipy.sparse import rand
 
 rfuncs = {'sum': fn.sum, 'max': fn.max, 'min': fn.min, 'mean': fn.mean}
 fill_value = {'sum': 0, 'max': float("-inf")}
 feat_size = 2
-
-@unittest.skipIf(dgl.backend.backend_name != 'pytorch', reason='Only support PyTorch for now')
 
 def create_test_heterograph(idtype):
     # test heterograph from the docstring, plus a user -- wishes -- game relation
@@ -37,12 +36,30 @@ def create_test_heterograph(idtype):
     assert g.idtype == idtype
     assert g.device == F.ctx()
     return g
+    
+@unittest.skipIf(dgl.backend.backend_name != 'pytorch', reason='Only support PyTorch for now')
+def test_edge_softmax_unidirectional():
+    g = dgl.heterograph({
+        ('A', 'AB', 'B'): ([1,2,3,1,2,3,1,2,3],[0,0,0,1,1,1,2,2,2]),
+        ('B', 'BB', 'B'): ([0,1,2,0,1,2,0,1,2], [0,0,0,1,1,1,2,2,2])})
+    g = g.to(F.ctx())
+    g.edges['AB'].data['x'] = F.ones(9) * 2
+    g.edges['BB'].data['x'] = F.ones(9)
+    result = dgl.ops.edge_softmax(g, {'AB': g.edges['AB'].data['x'], 'BB': g.edges['BB'].data['x']})
+
+    ab = result['A', 'AB', 'B']
+    bb = result['B', 'BB', 'B']
+    e2 = F.zeros_like(ab) + math.exp(2) / ((math.exp(2) + math.exp(1)) * 3)
+    e1 = F.zeros_like(bb) + math.exp(1) / ((math.exp(2) + math.exp(1)) * 3)
+    assert F.allclose(ab, e2)
+    assert F.allclose(bb, e1)
 
 
+@unittest.skipIf(dgl.backend.backend_name != 'pytorch', reason='Only support PyTorch for now')
 @pytest.mark.parametrize('g', get_cases(['clique']))
 @pytest.mark.parametrize('norm_by', ['src', 'dst'])
 # @pytest.mark.parametrize('shp', edge_softmax_shapes)
-@parametrize_dtype
+@parametrize_idtype
 def test_edge_softmax(g, norm_by, idtype):
     print("params", norm_by, idtype)
 
@@ -109,5 +126,4 @@ def test_edge_softmax(g, norm_by, idtype):
         assert F.allclose(grad_edata_hm, grad_edata_ht)
 
 if __name__ == '__main__':
-    test_edge_softmax()
-
+    test_edge_softmax_unidirectional()

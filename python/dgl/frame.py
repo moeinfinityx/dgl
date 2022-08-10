@@ -8,7 +8,7 @@ from . import backend as F
 from .base import DGLError, dgl_warning
 from .init import zero_initializer
 from .storages import TensorStorage
-from .utils import gather_pinned_tensor_rows, pin_memory_inplace, unpin_memory_inplace
+from .utils import gather_pinned_tensor_rows, pin_memory_inplace
 
 class _LazyIndex(object):
     def __init__(self, index):
@@ -182,12 +182,9 @@ class Column(TensorStorage):
     index : Tensor
         Index tensor
     """
-    def __init__(self, storage, scheme=None, index=None, device=None):
+    def __init__(self, storage, *args, **kwargs):
         super().__init__(storage)
-        self.scheme = scheme if scheme else infer_scheme(storage)
-        self.index = index
-        self.device = device
-        self.pinned_by_dgl = False
+        self._init(*args, **kwargs)
 
     def __len__(self):
         """The number of features (number of rows) in this column."""
@@ -230,13 +227,21 @@ class Column(TensorStorage):
         if self.device is not None:
             self.storage = F.copy_to(self.storage, self.device[0], **self.device[1])
             self.device = None
+
+        # convert data to the right type
+        if self.deferred_dtype is not None:
+            self.storage = F.astype(self.storage, self.deferred_dtype)
+            self.deferred_dtype = None
         return self.storage
 
     @data.setter
     def data(self, val):
         """Update the column data."""
         self.index = None
+        self.device = None
+        self.deferred_dtype = None
         self.storage = val
+        self._data_nd = None  # should unpin data if it was pinned.
         self.pinned_by_dgl = False
 
     def to(self, device, **kwargs): # pylint: disable=invalid-name
@@ -256,6 +261,49 @@ class Column(TensorStorage):
         """
         col = self.clone()
         col.device = (device, kwargs)
+        return col
+
+    @property
+    def dtype(self):
+        """ Return the effective data type of this Column """
+        if self.deferred_dtype is not None:
+            return self.deferred_dtype
+        return self.storage.dtype
+
+    def astype(self, new_dtype):
+        """ Return a new column such that when its data is requested,
+        it will be converted to new_dtype.
+
+        Parameters
+        ----------
+        new_dtype : Framework-specific type object
+            The type to convert the data to.
+
+        Returns
+        -------
+        Column
+            A new column
+        """
+        col = self.clone()
+        if col.dtype != new_dtype:
+            # If there is already a pending conversion, ensure that the pending
+            # conversion and transfer/sampling are done before this new conversion.
+            if col.deferred_dtype is not None:
+                _ = col.data
+
+            if (col.device is None) and (col.index is None):
+                # Do the conversion immediately if no device transfer or index
+                # sampling is pending.  The assumption is that this is most
+                # likely to be the desired behaviour, such as converting an
+                # entire graph's feature data to float16 (half) before transfer
+                # to device when training, or converting back to float32 (float)
+                # after fetching the data to a device.
+                col.storage = F.astype(col.storage, new_dtype)
+            else:
+                # Defer the conversion if there is a pending transfer or sampling.
+                # This is so that feature data that never gets accessed on the
+                # device never needs to be transferred or sampled or converted.
+                col.deferred_dtype = new_dtype
         return col
 
     def __getitem__(self, rowids):
@@ -329,7 +377,7 @@ class Column(TensorStorage):
 
     def clone(self):
         """Return a shallow copy of this column."""
-        return Column(self.storage, self.scheme, self.index, self.device)
+        return Column(self.storage, self.scheme, self.index, self.device, self.deferred_dtype)
 
     def deepclone(self):
         """Return a deepcopy of this column.
@@ -358,13 +406,13 @@ class Column(TensorStorage):
             Sub-column
         """
         if self.index is None:
-            return Column(self.storage, self.scheme, rowids, self.device)
+            return Column(self.storage, self.scheme, rowids, self.device, self.deferred_dtype)
         else:
             index = self.index
             if not isinstance(index, _LazyIndex):
                 index = _LazyIndex(self.index)
             index = index.slice(rowids)
-            return Column(self.storage, self.scheme, index, self.device)
+            return Column(self.storage, self.scheme, index, self.device, self.deferred_dtype)
 
     @staticmethod
     def create(data):
@@ -379,15 +427,50 @@ class Column(TensorStorage):
 
     def __getstate__(self):
         if self.storage is not None:
-            _ = self.data               # evaluate feature slicing
-        return self.__dict__
+            # flush any deferred operations
+            _ = self.data
+        state = self.__dict__.copy()
+        # data pinning does not get serialized, so we need to remove that from
+        # the state
+        state['_data_nd'] = None
+        state['pinned_by_dgl'] = False
+        return state
+
+    def __setstate__(self, state):
+        index = None
+        device = None
+        if 'storage' in state and state['storage'] is not None:
+            assert 'index' not in state or state['index'] is None
+            assert 'device' not in state or state['device'] is None
+        else:
+            # we may have a column with only index information, and that is
+            # valid
+            index = None if 'index' not in state else state['index']
+            device = None if 'device' not in state else state['device']
+        assert 'deferred_dtype' not in state or state['deferred_dtype'] is None
+        assert 'pinned_by_dgl' not in state or state['pinned_by_dgl'] is False
+        assert '_data_nd' not in state or state['_data_nd'] is None
+
+        self.__dict__ = state
+        # properly initialize this object
+        self._init(self.scheme if hasattr(self, 'scheme') else None,
+                   index=index,
+                   device=device)
+
+    def _init(self, scheme=None, index=None, device=None, deferred_dtype=None):
+        self.scheme = scheme if scheme else infer_scheme(self.storage)
+        self.index = index
+        self.device = device
+        self.deferred_dtype = deferred_dtype
+        self.pinned_by_dgl = False
+        self._data_nd = None
 
     def __copy__(self):
         return self.clone()
 
     def fetch(self, indices, device, pin_memory=False, **kwargs):
         _ = self.data           # materialize in case of lazy slicing & data transfer
-        return super().fetch(indices, device, pin_memory=False, **kwargs)
+        return super().fetch(indices, device, pin_memory=pin_memory, **kwargs)
 
     def pin_memory_(self):
         """Pin the storage into page-locked memory.
@@ -395,7 +478,7 @@ class Column(TensorStorage):
         Does nothing if the storage is already pinned.
         """
         if not self.pinned_by_dgl and not F.is_pinned(self.data):
-            pin_memory_inplace(self.data)
+            self._data_nd = pin_memory_inplace(self.data)
             self.pinned_by_dgl = True
 
     def unpin_memory_(self):
@@ -405,7 +488,8 @@ class Column(TensorStorage):
         it is actually in page-locked memory.
         """
         if self.pinned_by_dgl:
-            unpin_memory_inplace(self.data)
+            self._data_nd.unpin_memory_()
+            self._data_nd = None
             self.pinned_by_dgl = False
 
 class Frame(MutableMapping):
@@ -792,3 +876,32 @@ class Frame(MutableMapping):
         if necessary."""
         for column in self._columns.values():
             column.unpin_memory_()
+
+    def _astype_float(self, new_type):
+        assert new_type in [F.float64, F.float32, F.float16], \
+            "'new_type' must be floating-point type: %s" % str(new_type)
+        newframe = self.clone()
+        new_columns = {}
+        for name, column in self._columns.items():
+            dtype = column.dtype
+            if dtype != new_type and dtype in [F.float64, F.float32, F.float16]:
+                new_columns[name] = column.astype(new_type)
+            else:
+                new_columns[name] = column
+        newframe._columns = new_columns
+        return newframe
+
+    def half(self):
+        """ Return a new frame with all floating-point columns converted
+        to half-precision (float16) """
+        return self._astype_float(F.float16)
+
+    def float(self):
+        """ Return a new frame with all floating-point columns converted
+        to single-precision (float32) """
+        return self._astype_float(F.float32)
+
+    def double(self):
+        """ Return a new frame with all floating-point columns converted
+        to double-precision (float64) """
+        return self._astype_float(F.float64)

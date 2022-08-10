@@ -12,11 +12,9 @@ from torch.utils import dlpack
 from ... import ndarray as nd
 from ..._deprecate import kernel as K
 from ...function.base import TargetCode
-from ...base import dgl_warning
 
-if LooseVersion(th.__version__) < LooseVersion("1.8.0"):
-    raise Exception("Detected an old version of PyTorch. Please update torch>=1.8.0 "
-                    "for the best experience.")
+if LooseVersion(th.__version__) < LooseVersion("1.9.0"):
+    raise RuntimeError("DGL requires PyTorch >= 1.9.0")
 
 def data_type_dict():
     return {'float16' : th.float16,
@@ -349,6 +347,10 @@ else:
         return nd.from_dlpack(dlpack.to_dlpack(data.contiguous()))
 
 def zerocopy_to_dgl_ndarray_for_write(input):
+    assert input.is_contiguous(), "Cannot convert non-contiguous tensors " \
+        "to dgl ndarray for write. Call .to_contiguous() first."
+    assert input.numel() == input.storage().size(), "Cannot convert view " \
+        "tensors to dgl ndarray for write."
     return zerocopy_to_dgl_ndarray(input)
 
 def zerocopy_from_dgl_ndarray(data):
@@ -416,8 +418,6 @@ class BinaryReduce(th.autograd.Function):
     def backward(ctx, grad_out):
         reducer, binary_op, graph, lhs, rhs, lhs_map, rhs_map, out_map, \
             feat_shape, degs = ctx.backward_cache
-        # See https://github.com/dmlc/dgl/pull/3386
-        ctx.backward_cache = None
         lhs_data, rhs_data, out_data = ctx.saved_tensors
         lhs_data_nd = zerocopy_to_dgl_ndarray(lhs_data)
         rhs_data_nd = zerocopy_to_dgl_ndarray(rhs_data)
@@ -495,8 +495,6 @@ class CopyReduce(th.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         reducer, graph, target, in_map, out_map, degs = ctx.backward_cache
-        # See https://github.com/dmlc/dgl/pull/3386
-        ctx.backward_cache = None
         in_data, out_data = ctx.saved_tensors
         in_data_nd = zerocopy_to_dgl_ndarray(in_data)
         out_data_nd = zerocopy_to_dgl_ndarray(out_data)

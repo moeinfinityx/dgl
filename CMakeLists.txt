@@ -26,7 +26,7 @@ dgl_option(USE_CUDA "Build with CUDA" OFF)
 dgl_option(USE_NCCL "Build with NCCL support" OFF)
 dgl_option(USE_SYSTEM_NCCL "Build using system's NCCL library" OFF)
 dgl_option(USE_OPENMP "Build with OpenMP" ON)
-dgl_option(USE_AVX "Build with AVX optimization" ON)
+dgl_option(USE_AVX "Build with AVX optimization" OFF)
 dgl_option(USE_LIBXSMM "Build with LIBXSMM library optimization" ON)
 dgl_option(USE_FP16 "Build with fp16 support to enable mixed precision training" OFF)
 dgl_option(USE_TVM "Build with TVM kernels" OFF)
@@ -35,7 +35,7 @@ dgl_option(LIBCXX_ENABLE_PARALLEL_ALGORITHMS "Enable the parallel algorithms lib
 dgl_option(USE_S3 "Build with S3 support" OFF)
 dgl_option(USE_HDFS "Build with HDFS support" OFF) # Set env HADOOP_HDFS_HOME if needed
 dgl_option(REBUILD_LIBXSMM "Clean LIBXSMM build cache at every build" OFF) # Set env HADOOP_HDFS_HOME if needed
-dgl_option(USE_EPOLL "Build with epoll for socket communicator" OFF)
+dgl_option(USE_EPOLL "Build with epoll for socket communicator" ON)
 dgl_option(TP_BUILD_LIBUV "Build libuv together with tensorpipe (only impacts Linux)" ON)
 
 # Set debug compile option for gdb, only happens when -DCMAKE_BUILD_TYPE=DEBUG
@@ -46,18 +46,12 @@ endif(NOT MSVC)
 if(USE_CUDA)
   message(STATUS "Build with CUDA support")
   project(dgl C CXX)
+  # see https://github.com/NVIDIA/thrust/issues/1401
+  add_definitions(-DTHRUST_CUB_WRAPPED_NAMESPACE=dgl)
   include(cmake/modules/CUDA.cmake)
-  if ((CUDA_VERSION_MAJOR LESS 11) OR
-      ((CUDA_VERSION_MAJOR EQUAL 11) AND (CUDA_VERSION_MINOR EQUAL 0)))
-    # For cuda<11, use external CUB/Thrust library because CUB is not part of CUDA.
-    # For cuda==11.0, use external CUB/Thrust library because there is a bug in the
-    #   official CUB library which causes invalid device ordinal error for DGL. The bug
-    #   is fixed by https://github.com/NVIDIA/cub/commit/9143e47e048641aa0e6ddfd645bcd54ff1059939
-    #   in 11.1.
-    message(STATUS "Detected CUDA of version ${CUDA_VERSION}. Use external CUB/Thrust library.")
-    cuda_include_directories(BEFORE "${CMAKE_SOURCE_DIR}/third_party/thrust")
-    cuda_include_directories(BEFORE "${CMAKE_SOURCE_DIR}/third_party/cub")
-  endif()
+  message(STATUS "Use external CUB/Thrust library for a consistent API and performance.")
+  cuda_include_directories(BEFORE "${CMAKE_SOURCE_DIR}/third_party/thrust")
+  cuda_include_directories(BEFORE "${CMAKE_SOURCE_DIR}/third_party/cub")
 endif(USE_CUDA)
 
 # initial variables
@@ -122,11 +116,14 @@ if(USE_AVX)
   endif(USE_LIBXSMM)
 endif(USE_AVX)
 
-if (USE_EPOLL)
-  check_include_file("sys/epoll.h" USE_EPOLL)
-  if (USE_EPOLL)
+if ((NOT MSVC) AND USE_EPOLL)
+  INCLUDE(CheckIncludeFile)
+  check_include_file("sys/epoll.h" EPOLL_AVAILABLE)
+  if (EPOLL_AVAILABLE)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DUSE_EPOLL")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUSE_EPOLL")
+  else()
+    message(WARNING "EPOLL is not available on this platform...")
   endif()
 endif ()
 
@@ -301,6 +298,7 @@ if(BUILD_TORCH)
       ${CMAKE_COMMAND} -E env
       CMAKE_COMMAND=${CMAKE_CMD}
       CUDA_TOOLKIT_ROOT_DIR=${CUDA_TOOLKIT_ROOT_DIR}
+      USE_CUDA=${USE_CUDA}
       BINDIR=${BINDIR}
       cmd /e:on /c ${BUILD_SCRIPT} ${TORCH_PYTHON_INTERPS}
       DEPENDS ${BUILD_SCRIPT}
@@ -312,6 +310,7 @@ if(BUILD_TORCH)
       ${CMAKE_COMMAND} -E env
       CMAKE_COMMAND=${CMAKE_CMD}
       CUDA_TOOLKIT_ROOT_DIR=${CUDA_TOOLKIT_ROOT_DIR}
+      USE_CUDA=${USE_CUDA}
       BINDIR=${CMAKE_CURRENT_BINARY_DIR}
       bash ${BUILD_SCRIPT} ${TORCH_PYTHON_INTERPS}
       DEPENDS ${BUILD_SCRIPT}
@@ -340,4 +339,14 @@ if(BUILD_CPP_TEST)
   target_link_libraries(runUnitTests gtest gtest_main)
   target_link_libraries(runUnitTests dgl)
   add_test(UnitTests runUnitTests)
+
+  if(NOT MSVC)
+    message(STATUS "Building dist/rpc tests")
+    file(GLOB_RECURSE TEST_SRC_FILES ${PROJECT_SOURCE_DIR}/tests/dist/cpp/rpc_client.cc)
+    add_executable(rpc_client ${TEST_SRC_FILES})
+    target_link_libraries(rpc_client dgl)
+    file(GLOB_RECURSE TEST_SRC_FILES ${PROJECT_SOURCE_DIR}/tests/dist/cpp/rpc_server.cc)
+    add_executable(rpc_server ${TEST_SRC_FILES})
+    target_link_libraries(rpc_server dgl)
+  endif(NOT MSVC)
 endif(BUILD_CPP_TEST)

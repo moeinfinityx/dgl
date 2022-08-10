@@ -9,7 +9,7 @@ import numpy as np
 from ..heterograph import DGLHeteroGraph
 from ..convert import heterograph as dgl_heterograph
 from ..convert import graph as dgl_graph
-from ..transforms import compact_graphs
+from ..transforms import compact_graphs, sort_csr_by_tag, sort_csc_by_tag
 from .. import heterograph_index
 from .. import backend as F
 from ..base import NID, EID, NTYPE, ETYPE, ALL, is_all
@@ -17,7 +17,7 @@ from .kvstore import KVServer, get_kvstore
 from .._ffi.ndarray import empty_shared_mem
 from ..ndarray import exist_shared_mem_array
 from ..frame import infer_scheme
-from .partition import load_partition, load_partition_book
+from .partition import load_partition, load_partition_feats, load_partition_book
 from .graph_partition_book import PartitionPolicy, get_shared_mem_partition_book
 from .graph_partition_book import HeteroDataName, parse_hetero_data_name
 from .graph_partition_book import NodePartitionPolicy, EdgePartitionPolicy
@@ -311,10 +311,13 @@ class DistGraphServer(KVServer):
         The graph formats.
     keep_alive : bool
         Whether to keep server alive when clients exit
+    net_type : str
+        Backend rpc type: ``'socket'`` or ``'tensorpipe'``
     '''
     def __init__(self, server_id, ip_config, num_servers,
                  num_clients, part_config, disable_shared_mem=False,
-                 graph_format=('csc', 'coo'), keep_alive=False):
+                 graph_format=('csc', 'coo'), keep_alive=False,
+                 net_type='socket'):
         super(DistGraphServer, self).__init__(server_id=server_id,
                                               ip_config=ip_config,
                                               num_servers=num_servers,
@@ -322,18 +325,39 @@ class DistGraphServer(KVServer):
         self.ip_config = ip_config
         self.num_servers = num_servers
         self.keep_alive = keep_alive
+        self.net_type = net_type
         # Load graph partition data.
         if self.is_backup_server():
             # The backup server doesn't load the graph partition. It'll initialized afterwards.
             self.gpb, graph_name, ntypes, etypes = load_partition_book(part_config, self.part_id)
             self.client_g = None
         else:
-            self.client_g, node_feats, edge_feats, self.gpb, graph_name, \
-                    ntypes, etypes = load_partition(part_config, self.part_id)
+            # Loading of node/edge_feats are deferred to lower the peak memory consumption.
+            self.client_g, _, _, self.gpb, graph_name, \
+                    ntypes, etypes = load_partition(part_config, self.part_id, load_feats=False)
             print('load ' + graph_name)
+            # formatting dtype
+            # TODO(Rui) Formatting forcely is not a perfect solution.
+            #   We'd better store all dtypes when mapping to shared memory
+            #   and map back with original dtypes.
+            for k, dtype in FIELD_DICT.items():
+                if k in self.client_g.ndata:
+                    self.client_g.ndata[k] = F.astype(
+                        self.client_g.ndata[k], dtype)
+                if k in self.client_g.edata:
+                    self.client_g.edata[k] = F.astype(
+                        self.client_g.edata[k], dtype)
             # Create the graph formats specified the users.
             self.client_g = self.client_g.formats(graph_format)
             self.client_g.create_formats_()
+            # Sort underlying matrix beforehand to avoid runtime overhead during sampling.
+            if len(etypes) > 1:
+                if 'csr' in graph_format:
+                    self.client_g = sort_csr_by_tag(
+                        self.client_g, tag=self.client_g.edata[ETYPE], tag_type='edge')
+                if 'csc' in graph_format:
+                    self.client_g = sort_csc_by_tag(
+                        self.client_g, tag=self.client_g.edata[ETYPE], tag_type='edge')
             if not disable_shared_mem:
                 self.client_g = _copy_graph_to_shared_mem(self.client_g, graph_name, graph_format)
 
@@ -348,6 +372,7 @@ class DistGraphServer(KVServer):
             self.add_part_policy(PartitionPolicy(edge_name.policy_str, self.gpb))
 
         if not self.is_backup_server():
+            node_feats, edge_feats = load_partition_feats(part_config, self.part_id)
             for name in node_feats:
                 # The feature name has the following format: node_type + "/" + feature_name to avoid
                 # feature name collision for different node types.
@@ -376,7 +401,9 @@ class DistGraphServer(KVServer):
         start_server(server_id=self.server_id,
                      ip_config=self.ip_config,
                      num_servers=self.num_servers,
-                     num_clients=self.num_clients, server_state=server_state)
+                     num_clients=self.num_clients,
+                     server_state=server_state,
+                     net_type=self.net_type)
 
 class DistGraph:
     '''The class for accessing a distributed graph.
@@ -1105,7 +1132,8 @@ class DistGraph:
         gpb = self.get_partition_book()
         if len(gpb.etypes) > 1:
             # if etype is a canonical edge type (str, str, str), extract the edge type
-            if len(etype) == 3:
+            if isinstance(etype, tuple):
+                assert len(etype) == 3, 'Invalid canonical etype: {}'.format(etype)
                 etype = etype[1]
             edges = gpb.map_to_homo_eid(edges, etype)
         src, dst = dist_find_edges(self, edges)
@@ -1152,7 +1180,7 @@ class DistGraph:
         if isinstance(edges, dict):
             # TODO(zhengda) we need to directly generate subgraph of all relations with
             # one invocation.
-            if isinstance(edges, tuple):
+            if isinstance(list(edges.keys())[0], tuple):
                 subg = {etype: self.find_edges(edges[etype], etype[1]) for etype in edges}
             else:
                 subg = {}
@@ -1236,14 +1264,14 @@ class DistGraph:
         self._client.barrier()
 
     def sample_neighbors(self, seed_nodes, fanout, edge_dir='in', prob=None,
-                         exclude_edges=None, replace=False,
+                         exclude_edges=None, replace=False, etype_sorted=True,
                          output_device=None):
         # pylint: disable=unused-argument
         """Sample neighbors from a distributed graph."""
         # Currently prob, exclude_edges, output_device, and edge_dir are ignored.
         if len(self.etypes) > 1:
             frontier = graph_services.sample_etype_neighbors(
-                self, seed_nodes, ETYPE, fanout, replace=replace)
+                self, seed_nodes, ETYPE, fanout, replace=replace, etype_sorted=etype_sorted)
         else:
             frontier = graph_services.sample_neighbors(
                 self, seed_nodes, fanout, replace=replace)
