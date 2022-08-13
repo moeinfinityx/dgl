@@ -477,26 +477,26 @@ class HeteroGNNExplainer(nn.Module):
             Input node features.
         Returns
         -------
-        feat_mask : Dictionary of Tensor
+        feat_masks : Dictionary of Tensor
             Dictionary of { ntypes: features }
             Feature mask of shape :math:`(1, D)`, where :math:`D`
             is the feature size.
-        edge_mask : Dictionary of Tensor
+        edge_masks : Dictionary of Tensor
             Dictionary of { canonical_etypes: features }
             Edge mask of shape :math:`(E)`, where :math:`E` is the
             number of edges.
         """
         device = graph.device
-        feat_mask = {}
+        feat_masks = {}
         for node_type, feature in feat.items():
             if len(feature.size()) == 1:
-                feat_mask[node_type] = nn.Parameter(torch.zeros(1, 1, device=device))
+                feat_masks[node_type] = nn.Parameter(torch.zeros(1, 1, device=device))
             else:
                 std = 0.1
                 num_nodes, feat_size = feature.size()
-                feat_mask[node_type] = nn.Parameter(torch.randn(1, feat_size, device=device) * std)
+                feat_masks[node_type] = nn.Parameter(torch.randn(1, feat_size, device=device) * std)
 
-        edge_mask = {}
+        edge_masks = {}
         for canonical_etype in graph.canonical_etypes:
             src = canonical_etype[0]
             num_nodes = graph.number_of_nodes(src)
@@ -504,9 +504,9 @@ class HeteroGNNExplainer(nn.Module):
             std = nn.init.calculate_gain('relu')
             if num_nodes > 0:
                 std *= sqrt((2.0 / (2 * num_nodes)))
-            edge_mask[canonical_etype] = nn.Parameter(torch.randn(num_edges, device=device) * std)
+            edge_masks[canonical_etype] = nn.Parameter(torch.randn(num_edges, device=device) * std)
 
-        return feat_mask, edge_mask
+        return feat_masks, edge_masks
 
     def _loss_regularize(self, loss, feat_masks, edge_masks):
         r"""Add regularization terms to the loss.
@@ -663,8 +663,9 @@ class HeteroGNNExplainer(nn.Module):
         inverse_indices = inverse_indices[ntype]
         sg_nodes = sg.ndata[NID]
         sg_edges = sg.edata[EID]
+        sg_feats = {}
         for node_type in feat.keys():
-            feat[node_type] = feat[node_type][sg_nodes[node_type]]
+            sg_feats[node_type] = feat[node_type][sg_nodes[node_type]]
         for key, item in kwargs.items():
             if torch.is_tensor(item) and item.size(0) == num_nodes:
                 item = item[sg_nodes]
@@ -674,10 +675,10 @@ class HeteroGNNExplainer(nn.Module):
 
         # Get the initial prediction.
         with torch.no_grad():
-            logits = self.model(sg, feat, **kwargs)[ntype]
+            logits = self.model(sg, sg_feats, **kwargs)[ntype]
             pred_label = logits.argmax(dim=-1)
 
-        feat_mask, edge_mask = self._init_masks(sg, feat)
+        feat_mask, edge_mask = self._init_masks(sg, sg_feats)
 
         params = [*feat_mask.values(), *edge_mask.values()]
         optimizer = torch.optim.Adam(params, lr=self.lr)
@@ -689,8 +690,8 @@ class HeteroGNNExplainer(nn.Module):
         for _ in range(self.num_epochs):
             optimizer.zero_grad()
             h = {}
-            for node_type in feat.keys():
-                h[node_type] = feat[node_type] * feat_mask[node_type].sigmoid()
+            for node_type in sg_feats.keys():
+                h[node_type] = sg_feats[node_type] * feat_mask[node_type].sigmoid()
             eweight = {}
             for canonical_etype in edge_mask.keys():
                 eweight[canonical_etype] = edge_mask[canonical_etype].sigmoid()
